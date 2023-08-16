@@ -1,6 +1,8 @@
 import React, { useContext, useEffect, useMemo, useState } from 'react'
 import { parseLinkHeader } from '@web3-storage/parse-link-header'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useParams } from 'react-router-dom'
+import useRoom from '../../room';
+import { useAccount } from '../../account';
 
 export const CinemaModeContext = React.createContext(null);
 
@@ -21,10 +23,13 @@ export function CinemaModeProvider({ children }) {
 }
 
 function PlayerPage() {
+  const { roomId } = useParams()
+  const room = useRoom(roomId)
   const { cinemaMode, toggleCinemaMode } = useContext(CinemaModeContext);
   return (
     <div className={`flex flex-col items-center ${!cinemaMode && 'mx-auto px-2 py-2 container'}`}>
-      <Player cinemaMode={cinemaMode} />
+      <Streams streamers={room.users.filter((user) => user.streaming)} />
+      <OnlineUsers users={room.users} />
       <button className='bg-blue-900 px-4 py-2 rounded-lg mt-6' onClick={toggleCinemaMode}>
         {cinemaMode ? "Disable cinema mode" : "Enable cinema mode"}
       </button>
@@ -32,7 +37,21 @@ function PlayerPage() {
   )
 }
 
-function Player({ cinemaMode }) {
+function Streams({ streamers }) {
+  const account = useAccount()
+  return (
+    <>
+      {streamers.map((streamer) => ( // todo: sort
+        <React.Fragment key={streamer.id}>
+          <p className='text-lg'>{streamer.id} user video:</p>
+          <Player key={streamer.id} account={account} streamer={streamer} />
+        </React.Fragment>
+      ))}
+    </>
+  )
+}
+
+function Player({ account, streamer, cinemaMode }) {
   const videoRef = React.createRef()
   const location = useLocation()
   const [videoLayers, setVideoLayers] = React.useState([]);
@@ -51,9 +70,10 @@ function Player({ cinemaMode }) {
 
   React.useEffect(() => {
     if (videoRef.current) {
+      console.log("video ref changed");
       videoRef.current.srcObject = mediaSrcObject
     }
-  }, [mediaSrcObject, videoRef])
+  }, [mediaSrcObject, videoRef.current])
 
   React.useEffect(() => {
     const peerConnection = new RTCPeerConnection() // eslint-disable-line
@@ -68,25 +88,24 @@ function Player({ cinemaMode }) {
     peerConnection.createOffer().then(offer => {
       peerConnection.setLocalDescription(offer)
 
-      fetch(`${process.env.REACT_APP_API_PATH}/whep`, {
+      fetch(`${process.env.REACT_APP_API_PATH}/whep/${encodeURIComponent(streamer.id)}`, {
         method: 'POST',
         body: offer.sdp,
         headers: {
-          Authorization: `Bearer ${location.pathname.substring(1)}`,
+          Authorization: `Bearer ` + account.token,
           'Content-Type': 'application/sdp'
         }
       }).then(r => {
         const parsedLinkHeader = parseLinkHeader(r.headers.get('Link'))
         setLayerEndpoint(`${window.location.protocol}//${parsedLinkHeader['urn:ietf:params:whep:ext:core:layer'].url}`)
 
-        const evtSource = new EventSource(`${window.location.protocol}//${parsedLinkHeader['urn:ietf:params:whep:ext:core:server-sent-events'].url}`)
-        evtSource.onerror = err => evtSource.close();
+        // const evtSource = new EventSource(`${window.location.protocol}//${parsedLinkHeader['urn:ietf:params:whep:ext:core:server-sent-events'].url}`)
+        // evtSource.onerror = err => evtSource.close();
 
-        evtSource.addEventListener("layers", event => {
-          const parsed = JSON.parse(event.data)
-          setVideoLayers(parsed['1']['layers'].map(l => l.encodingId))
-        })
-
+        // evtSource.addEventListener("layers", event => {
+        //   const parsed = JSON.parse(event.data)
+        //   setVideoLayers(parsed['1']['layers'].map(l => l.encodingId))
+        // })
 
         return r.text()
       }).then(answer => {
@@ -100,7 +119,7 @@ function Player({ cinemaMode }) {
     return function cleanup() {
       peerConnection.close()
     }
-  }, [location.pathname])
+  }, [location.pathname, account.token, streamer.id])
 
   return (
     <>
@@ -121,6 +140,26 @@ function Player({ cinemaMode }) {
           })}
         </select>
       }
+    </>
+  )
+}
+
+function OnlineUsers({ users }) {
+  return (
+    <>
+      <p className="text-xl mt-5">Users in room: {users.length}</p>
+
+      {users.map((user) => (
+        <User key={user.id} user={user} />
+      ))}
+    </>
+  )
+}
+
+function User({ user }) {
+  return (
+    <>
+      <h2>User: {user.id}</h2>
     </>
   )
 }

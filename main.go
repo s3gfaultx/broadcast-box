@@ -12,7 +12,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/glimesh/broadcast-box/internal/webrtc"
+	"github.com/glimesh/broadcast-box/internal/room"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 )
 
@@ -35,6 +36,7 @@ func logHTTPError(w http.ResponseWriter, err string, code int) {
 
 func whipHandler(res http.ResponseWriter, r *http.Request) {
 	streamKey := r.Header.Get("Authorization")
+	streamKey = strings.TrimPrefix(streamKey, "Bearer ")
 	if streamKey == "" {
 		logHTTPError(res, "Authorization was not set", http.StatusBadRequest)
 		return
@@ -46,7 +48,7 @@ func whipHandler(res http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	answer, err := webrtc.WHIP(string(offer), streamKey)
+	answer, err := room.WHIP(string(offer), streamKey)
 	if err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
@@ -58,8 +60,18 @@ func whipHandler(res http.ResponseWriter, r *http.Request) {
 }
 
 func whepHandler(res http.ResponseWriter, req *http.Request) {
-	streamKey := req.Header.Get("Authorization")
-	if streamKey == "" {
+	vals := strings.Split(req.URL.Path, "/")
+	streamerIdStr := vals[len(vals)-1]
+	log.Println("Wheep handler of streamer id", streamerIdStr)
+	streamerId, err := uuid.Parse(streamerIdStr)
+	if err != nil {
+		logHTTPError(res, fmt.Errorf("parse streamer id: %w", err).Error(), http.StatusBadRequest)
+		return
+	}
+
+	authToken := req.Header.Get("Authorization")
+	authToken = strings.TrimPrefix(authToken, "Bearer ")
+	if authToken == "" {
 		logHTTPError(res, "Authorization was not set", http.StatusBadRequest)
 		return
 	}
@@ -70,15 +82,15 @@ func whepHandler(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	answer, whepSessionId, err := webrtc.WHEP(string(offer), streamKey)
+	answer, streamerIdStr, err := room.WHEP(string(offer), authToken, streamerId)
 	if err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	apiPath := req.Host + strings.TrimSuffix(req.URL.RequestURI(), "whep")
-	res.Header().Add("Link", `<`+apiPath+"sse/"+whepSessionId+`>; rel="urn:ietf:params:whep:ext:core:server-sent-events"; events="layers"`)
-	res.Header().Add("Link", `<`+apiPath+"layer/"+whepSessionId+`>; rel="urn:ietf:params:whep:ext:core:layer"`)
+	res.Header().Add("Link", `<`+apiPath+"sse/"+streamerIdStr+`>; rel="urn:ietf:params:whep:ext:core:server-sent-events"; events="layers"`)
+	res.Header().Add("Link", `<`+apiPath+"layer/"+streamerIdStr+`>; rel="urn:ietf:params:whep:ext:core:layer"`)
 	fmt.Fprint(res, answer)
 }
 
@@ -90,7 +102,7 @@ func whepServerSentEventsHandler(res http.ResponseWriter, req *http.Request) {
 	vals := strings.Split(req.URL.RequestURI(), "/")
 	whepSessionId := vals[len(vals)-1]
 
-	layers, err := webrtc.WHEPLayers(whepSessionId)
+	layers, err := room.WHEPLayers(whepSessionId)
 	if err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
@@ -111,9 +123,58 @@ func whepLayerHandler(res http.ResponseWriter, req *http.Request) {
 	vals := strings.Split(req.URL.RequestURI(), "/")
 	whepSessionId := vals[len(vals)-1]
 
-	if err := webrtc.WHEPChangeLayer(whepSessionId, r.EncodingId); err != nil {
+	if err := room.WHEPChangeLayer(whepSessionId, r.EncodingId); err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
+	}
+}
+
+func roomEvents(res http.ResponseWriter, req *http.Request) {
+	vals := strings.Split(req.URL.Path, "/")
+	roomId := vals[len(vals)-1]
+
+	authToken := req.URL.Query().Get("authToken")
+	if authToken == "" {
+		logHTTPError(res, "authToken query was not set", http.StatusUnauthorized)
+		return
+	}
+
+	flusher, ok := res.(http.Flusher)
+	if !ok {
+		logHTTPError(res, "streaming unsupported", http.StatusBadRequest)
+		return
+	}
+
+	room, session, err := room.JoinRoom(roomId, authToken)
+	if err != nil {
+		logHTTPError(res, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer func() {
+		room.RemoveUser(session)
+	}()
+
+	res.Header().Set("Content-Type", "text/event-stream")
+	res.Header().Set("Cache-Control", "no-cache")
+	res.Header().Set("Connection", "keep-alive")
+
+	for {
+		select {
+		case event := <-session.Events:
+			serialized, err := json.Marshal(event)
+			if err != nil {
+				logHTTPError(res, fmt.Errorf("marshal event: %s", err.Error()).Error(), http.StatusInternalServerError)
+				return
+			}
+			_, err = fmt.Fprintf(res, "event: %s\ndata: %s\n\n", event.Type(), serialized)
+			if err != nil {
+				logHTTPError(res, fmt.Errorf("write event: %s", err.Error()).Error(), http.StatusInternalServerError)
+				return
+			}
+			flusher.Flush()
+		case <-req.Context().Done():
+			return
+		}
 	}
 }
 
@@ -122,14 +183,14 @@ type StreamStatus struct {
 }
 
 func statusHandler(res http.ResponseWriter, req *http.Request) {
-	statuses := []StreamStatus{}
-	for _, s := range webrtc.GetAllStreams() {
-		statuses = append(statuses, StreamStatus{StreamKey: s})
-	}
+	// statuses := []StreamStatus{}
+	// for _, s := range webrtc.GetAllStreams() {
+	// 	statuses = append(statuses, StreamStatus{StreamKey: s})
+	// }
 
-	if err := json.NewEncoder(res).Encode(statuses); err != nil {
-		logHTTPError(res, err.Error(), http.StatusBadRequest)
-	}
+	// if err := json.NewEncoder(res).Encode(statuses); err != nil {
+	// 	logHTTPError(res, err.Error(), http.StatusBadRequest)
+	// }
 }
 
 func indexHTMLWhenNotFound(fs http.FileSystem) http.Handler {
@@ -174,12 +235,13 @@ func main() {
 		}
 	}
 
-	webrtc.Configure()
+	room.Configure()
 
 	mux := http.NewServeMux()
 	mux.Handle("/", indexHTMLWhenNotFound(http.Dir("./web/build")))
 	mux.HandleFunc("/api/whip", corsHandler(whipHandler))
-	mux.HandleFunc("/api/whep", corsHandler(whepHandler))
+	mux.HandleFunc("/api/whep/", corsHandler(whepHandler))
+	mux.HandleFunc("/api/room/", corsHandler(roomEvents))
 	mux.HandleFunc("/api/status", corsHandler(statusHandler))
 	mux.HandleFunc("/api/sse/", corsHandler(whepServerSentEventsHandler))
 	mux.HandleFunc("/api/layer/", corsHandler(whepLayerHandler))

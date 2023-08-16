@@ -1,4 +1,4 @@
-package webrtc
+package room
 
 import (
 	"strings"

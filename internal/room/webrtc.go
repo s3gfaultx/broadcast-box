@@ -1,4 +1,4 @@
-package webrtc
+package room
 
 import (
 	"encoding/json"
@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"sync"
 
 	"github.com/pion/ice/v2"
 	"github.com/pion/interceptor"
@@ -19,61 +18,9 @@ const (
 	videoTrackLabelDefault = "default"
 )
 
-type (
-	stream struct {
-		audioTrack       *webrtc.TrackLocalStaticRTP
-		videoTrackLabels []string
-		pliChan          chan any
-		whepSessionsLock sync.RWMutex
-		whepSessions     map[string]*whepSession
-	}
-)
-
 var (
-	streamMap     map[string]*stream
-	streamMapLock sync.Mutex
-	api           *webrtc.API
+	api *webrtc.API
 )
-
-func getStream(streamKey string) (*stream, error) {
-	foundStream, ok := streamMap[streamKey]
-	if !ok {
-		audioTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "pion")
-		if err != nil {
-			return nil, err
-		}
-
-		foundStream = &stream{
-			audioTrack:   audioTrack,
-			pliChan:      make(chan any, 50),
-			whepSessions: map[string]*whepSession{},
-		}
-		streamMap[streamKey] = foundStream
-	}
-
-	return foundStream, nil
-}
-
-func deleteStream(streamKey string) {
-	streamMapLock.Lock()
-	defer streamMapLock.Unlock()
-
-	delete(streamMap, streamKey)
-}
-
-func addTrack(stream *stream, rid string) error {
-	streamMapLock.Lock()
-	defer streamMapLock.Unlock()
-
-	for i := range stream.videoTrackLabels {
-		if rid == stream.videoTrackLabels[i] {
-			return nil
-		}
-	}
-
-	stream.videoTrackLabels = append(stream.videoTrackLabels, rid)
-	return nil
-}
 
 func getPublicIP() string {
 	req, err := http.Get("http://ip-api.com/json/")
@@ -259,8 +206,6 @@ func populateMediaEngine(m *webrtc.MediaEngine) error {
 }
 
 func Configure() {
-	streamMap = map[string]*stream{}
-
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := populateMediaEngine(mediaEngine); err != nil {
 		panic(err)
