@@ -12,6 +12,7 @@ import (
 
 	"log"
 	"net/http"
+	"net/url"
 
 	"github.com/glimesh/broadcast-box/internal/room"
 	"github.com/google/uuid"
@@ -83,22 +84,27 @@ func whepHandler(res http.ResponseWriter, req *http.Request) {
 		logHTTPError(res, "Authorization was not set", http.StatusBadRequest)
 		return
 	}
-
+	sessionId, err := uuid.Parse(req.URL.Query().Get("session"))
+	if err != nil {
+		logHTTPError(res, fmt.Errorf("parse viewer id: %w", err).Error(), http.StatusBadRequest)
+		return
+	}
 	offer, err := io.ReadAll(req.Body)
 	if err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	answer, streamerIdStr, err := room.WHEP(string(offer), authToken, streamerId)
+	answer, err := room.WHEP(string(offer), sessionId, streamerId)
 	if err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	apiPath := req.Host + strings.TrimSuffix(req.URL.RequestURI(), "whep")
-	res.Header().Add("Link", `<`+apiPath+"sse/"+streamerIdStr+`>; rel="urn:ietf:params:whep:ext:core:server-sent-events"; events="layers"`)
-	res.Header().Add("Link", `<`+apiPath+"layer/"+streamerIdStr+`>; rel="urn:ietf:params:whep:ext:core:layer"`)
+	apiPath := req.Host + "/api/"
+	targetPath := url.PathEscape(streamerIdStr) + "?viewer=" + url.QueryEscape(sessionId.String()) +
+		"&authToken=" + url.QueryEscape(authToken)
+	res.Header().Add("Link", `<`+apiPath+"sse/"+targetPath+`>; rel="urn:ietf:params:whep:ext:core:server-sent-events"; events="layers"`)
+	res.Header().Add("Link", `<`+apiPath+"layer/"+targetPath+`>; rel="urn:ietf:params:whep:ext:core:layer"`)
 	fmt.Fprint(res, answer)
 }
 
@@ -107,18 +113,49 @@ func whepServerSentEventsHandler(res http.ResponseWriter, req *http.Request) {
 	res.Header().Set("Cache-Control", "no-cache")
 	res.Header().Set("Connection", "keep-alive")
 
-	vals := strings.Split(req.URL.RequestURI(), "/")
-	whepSessionId := vals[len(vals)-1]
-
-	layers, err := room.WHEPLayers(whepSessionId)
+	vals := strings.Split(req.URL.Path, "/")
+	streamerIdStr := vals[len(vals)-1]
+	streamerSessionId, err := uuid.Parse(streamerIdStr)
 	if err != nil {
-		logHTTPError(res, err.Error(), http.StatusBadRequest)
+		logHTTPError(res, fmt.Errorf("parse streamer id: %w", err).Error(), http.StatusBadRequest)
 		return
 	}
+	authToken := req.URL.Query().Get("authToken")
+	if authToken == "" {
+		logHTTPError(res, "authorization not set", http.StatusBadRequest)
+		return
+	}
+	viewerSessionId, err := uuid.Parse(req.URL.Query().Get("viewer"))
+	if err != nil {
+		logHTTPError(res, fmt.Errorf("parse viewer id: %w", err).Error(), http.StatusBadRequest)
+		return
+	}
+	userRoom, viewerSession := room.FindSession(viewerSessionId)
+	if userRoom == nil || viewerSession == nil || viewerSession.User.AuthToken != authToken {
+		logHTTPError(res, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	streamer := userRoom.User(streamerSessionId)
+	if streamer == nil {
+		logHTTPError(res, "streamer not found", http.StatusNotFound)
+		return
+	}
+	// layers, err := room.WHEPLayers(viewerSession, streamer)
+	// if err != nil {
+	// 	logHTTPError(res, err.Error(), http.StatusBadRequest)
+	// 	return
+	// }
 
 	fmt.Fprint(res, "event: layers\n")
-	fmt.Fprintf(res, "data: %s\n", string(layers))
+	// fmt.Fprintf(res, "data: %s\n", layers)
 	fmt.Fprint(res, "\n\n")
+
+	// todo: make actually SSE an SSE stream
+	// for {
+	// 	select {
+	// 	case newLayer, ok := <-layers:
+	// 	}
+	// }
 }
 
 func whepLayerHandler(res http.ResponseWriter, req *http.Request) {
@@ -153,13 +190,13 @@ func roomEvents(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	room, user, err := room.Join(roomId, authToken)
+	userRoom, session, err := room.Join(roomId, authToken)
 	if err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer func() {
-		room.RemoveUser(user)
+		userRoom.RemoveSession(session)
 	}()
 
 	res.Header().Set("Content-Type", "text/event-stream")
@@ -168,7 +205,7 @@ func roomEvents(res http.ResponseWriter, req *http.Request) {
 
 	for {
 		select {
-		case event, ok := <-user.Events:
+		case event, ok := <-session.Events:
 			if !ok {
 				return
 			}

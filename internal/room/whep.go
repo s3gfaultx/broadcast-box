@@ -7,7 +7,6 @@ import (
 	"log"
 	"sync/atomic"
 
-	"github.com/google/uuid"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
@@ -26,30 +25,23 @@ type (
 	}
 )
 
-func WHEPLayers(whepSessionId string) ([]byte, error) {
-	// streamMapLock.Lock()
-	// defer streamMapLock.Unlock()
+func WHEPLayers(user, streamer *User) ([]byte, error) {
+	roomMapLock.Lock()
+	defer roomMapLock.Unlock()
 
+	stream := streamer.stream.Load().(*userStream)
+	if stream == nil {
+		return nil, errors.New("streamer is not streaming")
+	}
 	layers := []simulcastLayerResponse{}
-	// for streamKey := range streamMap {
-	// 	streamMap[streamKey].whepSessionsLock.Lock()
-	// 	defer streamMap[streamKey].whepSessionsLock.Unlock()
-
-	// 	if _, ok := streamMap[streamKey].whepSessions[whepSessionId]; ok {
-	// 		for i := range streamMap[streamKey].videoTrackLabels {
-	// 			layers = append(layers, simulcastLayerResponse{EncodingId: streamMap[streamKey].videoTrackLabels[i]})
-	// 		}
-
-	// 		break
-	// 	}
-	// }
-
+	for _, label := range stream.videoTrackLabels {
+		layers = append(layers, simulcastLayerResponse{EncodingId: label})
+	}
 	resp := map[string]map[string][]simulcastLayerResponse{
 		"1": {
 			"layers": layers,
 		},
 	}
-
 	return json.Marshal(resp)
 }
 
@@ -70,58 +62,49 @@ func WHEPChangeLayer(whepSessionId, layer string) error {
 	return nil
 }
 
-func WHEP(offer, authToken string, streamerId uuid.UUID) (string, string, error) {
-	roomMapLock.Lock()
-	var room *Room
-	var streamer *User
-	for _, activeRoom := range roomMap {
-		if user, ok := activeRoom.users[streamerId]; ok {
-			room = activeRoom
-			streamer = user
-			break
-		}
-	}
-	roomMapLock.Unlock()
-	if room == nil || streamer == nil {
-		return "", "", errors.New("invalid room id")
+func WHEP(offer string, viewerSessionId SessionId, streamerId UserId) (string, error) {
+	room, viewerSession := FindSession(viewerSessionId)
+	if room == nil || viewerSession == nil {
+		return "", errors.New("viewer session not found")
 	}
 
 	room.lock.Lock()
 	defer room.lock.Unlock()
 
-	viewer := room.findByToken(authToken)
-	if viewer == nil {
-		return "", "", errors.New("unauthorized")
+	streamer := room.user(streamerId)
+	if streamer == nil {
+		return "", errors.New("streamer not found")
 	}
 	streamVal := streamer.stream.Load()
 	if streamVal == nil {
-		return "", "", errors.New("user is not streaming")
+		return "", errors.New("user is not streaming")
 	}
 	stream := streamVal.(*userStream)
 
 	videoTrack := &trackMultiCodec{id: "video", streamID: "pion"}
 	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
-		return "", "", fmt.Errorf("new peer connection: %s", err)
+		return "", fmt.Errorf("new peer connection: %s", err)
 	}
 
 	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		if state == webrtc.ICEConnectionStateFailed {
 			if err := peerConnection.Close(); err != nil {
-				log.Printf("Could not close failed %s user connection: %s", authToken, err)
+				log.Printf("Could not close failed %s user WHEP connection: %s",
+					viewerSessionId.String(), err)
 			}
 		} else if state == webrtc.ICEConnectionStateClosed {
-			stream.removeViewer(viewer)
+			stream.removeViewer(viewerSession)
 		}
 	})
 
 	if _, err = peerConnection.AddTrack(stream.audioTrack); err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	rtpSender, err := peerConnection.AddTrack(videoTrack)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	go func() {
@@ -146,16 +129,16 @@ func WHEP(offer, authToken string, streamerId uuid.UUID) (string, string, error)
 		SDP:  offer,
 		Type: webrtc.SDPTypeOffer,
 	}); err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
 	answer, err := peerConnection.CreateAnswer(nil)
 
 	if err != nil {
-		return "", "", err
+		return "", err
 	} else if err = peerConnection.SetLocalDescription(answer); err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	<-gatherComplete
@@ -169,8 +152,8 @@ func WHEP(offer, authToken string, streamerId uuid.UUID) (string, string, error)
 		peerConn:   peerConnection,
 	}
 	whepSession.currentLayer.Store("")
-	stream.viewers[viewer.Id] = whepSession
-	return peerConnection.LocalDescription().SDP, viewer.Id.String(), nil
+	stream.viewers[viewerSession.Id] = whepSession
+	return peerConnection.LocalDescription().SDP, nil
 }
 
 func (w *whepSession) sendVideoPacket(rtpPkt *rtp.Packet, layer string, timeDiff uint32, isAV1 bool) error {
@@ -190,4 +173,8 @@ func (w *whepSession) sendVideoPacket(rtpPkt *rtp.Packet, layer string, timeDiff
 		return fmt.Errorf("write packet: %w", err)
 	}
 	return nil
+}
+
+func (w *whepSession) close() {
+	_ = w.peerConn.Close()
 }

@@ -1,0 +1,7 @@
+- clean, debloat code (and with it - simplify sync (currently mutexes) and FIX possible races)
+
+- update layout, preview stream key
+- user names, colors, persistent id?
+- reconnect eventstream
+- review security
+- room join ratelimit

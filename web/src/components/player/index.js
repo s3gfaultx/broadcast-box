@@ -1,57 +1,35 @@
-import React, { useContext, useEffect, useMemo, useState } from 'react'
+import React from 'react'
 import { parseLinkHeader } from '@web3-storage/parse-link-header'
 import { useLocation, useParams } from 'react-router-dom'
 import useRoom from '../../room';
 import { useAccount } from '../../account';
 
-export const CinemaModeContext = React.createContext(null);
-
-export function CinemaModeProvider({ children }) {
-  const [cinemaMode, setCinemaMode] = useState(() => localStorage.getItem("cinema-mode") === "true");
-  const state = useMemo(() => ({
-    cinemaMode,
-    setCinemaMode,
-    toggleCinemaMode: () => setCinemaMode((prev) => !prev),
-  }), [cinemaMode, setCinemaMode]);
-
-  useEffect(() => localStorage.setItem("cinema-mode", cinemaMode), [cinemaMode]);
-  return (
-    <CinemaModeContext.Provider value={state}>
-      {children}
-    </CinemaModeContext.Provider>
-  );
-}
-
 function PlayerPage() {
   const { roomId } = useParams()
   const room = useRoom(roomId)
-  const { cinemaMode, toggleCinemaMode } = useContext(CinemaModeContext);
   return (
-    <div className={`flex flex-col items-center ${!cinemaMode && 'mx-auto px-2 py-2 container'}`}>
-      <Streams streamers={room.users.filter((user) => user.streaming)} />
+    <div className={`flex flex-col items-center mx-auto px-2 py-2 container`}>
+      <Streams session={room.session} streamers={room.users.filter((user) => user.streaming)} />
       <OnlineUsers users={room.users} />
-      <button className='bg-blue-900 px-4 py-2 rounded-lg mt-6' onClick={toggleCinemaMode}>
-        {cinemaMode ? "Disable cinema mode" : "Enable cinema mode"}
-      </button>
     </div>
   )
 }
 
-function Streams({ streamers }) {
+function Streams({ session, streamers }) {
   const account = useAccount()
   return (
     <>
       {streamers.map((streamer) => ( // todo: sort
         <React.Fragment key={streamer.id}>
           <p className='text-lg'>{streamer.id} user video:</p>
-          <Player key={streamer.id} account={account} streamer={streamer} />
+          <Player key={streamer.id} account={account} session={session} streamer={streamer} />
         </React.Fragment>
       ))}
     </>
   )
 }
 
-function Player({ account, streamer, cinemaMode }) {
+function Player({ account, session, streamer, cinemaMode }) {
   const videoRef = React.createRef()
   const location = useLocation()
   const [videoLayers, setVideoLayers] = React.useState([]);
@@ -70,10 +48,9 @@ function Player({ account, streamer, cinemaMode }) {
 
   React.useEffect(() => {
     if (videoRef.current) {
-      console.log("video ref changed");
       videoRef.current.srcObject = mediaSrcObject
     }
-  }, [mediaSrcObject, videoRef.current])
+  }, [mediaSrcObject])
 
   React.useEffect(() => {
     const peerConnection = new RTCPeerConnection() // eslint-disable-line
@@ -88,7 +65,7 @@ function Player({ account, streamer, cinemaMode }) {
     peerConnection.createOffer().then(offer => {
       peerConnection.setLocalDescription(offer)
 
-      fetch(`${process.env.REACT_APP_API_PATH}/whep/${encodeURIComponent(streamer.id)}`, {
+      fetch(`${process.env.REACT_APP_API_PATH}/whep/${encodeURIComponent(streamer.id)}?session=${encodeURIComponent(session.id)}`, {
         method: 'POST',
         body: offer.sdp,
         headers: {
@@ -96,16 +73,20 @@ function Player({ account, streamer, cinemaMode }) {
           'Content-Type': 'application/sdp'
         }
       }).then(r => {
+        if (!r.ok) {
+          throw Error('invalid response status: ' + r.status)
+        }
         const parsedLinkHeader = parseLinkHeader(r.headers.get('Link'))
         setLayerEndpoint(`${window.location.protocol}//${parsedLinkHeader['urn:ietf:params:whep:ext:core:layer'].url}`)
 
-        // const evtSource = new EventSource(`${window.location.protocol}//${parsedLinkHeader['urn:ietf:params:whep:ext:core:server-sent-events'].url}`)
-        // evtSource.onerror = err => evtSource.close();
+        const evtSource = new EventSource(`${window.location.protocol}//${parsedLinkHeader['urn:ietf:params:whep:ext:core:server-sent-events'].url}`)
+        evtSource.onerror = err => evtSource.close();
 
-        // evtSource.addEventListener("layers", event => {
-        //   const parsed = JSON.parse(event.data)
-        //   setVideoLayers(parsed['1']['layers'].map(l => l.encodingId))
-        // })
+        evtSource.addEventListener("layers", event => {
+          const parsed = JSON.parse(event.data)
+          setVideoLayers(parsed['1']['layers'].map(l => l.encodingId))
+        })
+        // todo: close evtSource
 
         return r.text()
       }).then(answer => {
@@ -119,7 +100,7 @@ function Player({ account, streamer, cinemaMode }) {
     return function cleanup() {
       peerConnection.close()
     }
-  }, [location.pathname, account.token, streamer.id])
+  }, [location.pathname, account.token, session.id, streamer.id])
 
   return (
     <>

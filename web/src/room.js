@@ -10,6 +10,7 @@ function useRoom(roomId) {
 
     React.useEffect(() => {
         const handlers = {
+            "session": ({ sessionId }) => setRoom((room) => ({ ...room, session: { id: sessionId }, })),
             "users": ({ users }) => setRoom((room) => ({ ...room, users, })),
         }
 

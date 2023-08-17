@@ -23,13 +23,13 @@ var (
 type Room struct {
 	id string
 
-	lock  sync.RWMutex
-	users map[UserId]*User
+	lock     sync.RWMutex
+	sessions map[SessionId]*Session
 }
 
 // Join adds new user with provided authToken to existing room with given roomId or
 // creates new room with given roomId.
-func Join(roomId string, authToken string) (*Room, *User, error) {
+func Join(roomId string, authToken string) (*Room, *Session, error) {
 	if len(authToken) == 0 || len(authToken) >= 1024 {
 		return nil, nil, ErrInvalidAuthToken
 	}
@@ -37,22 +37,36 @@ func Join(roomId string, authToken string) (*Room, *User, error) {
 	roomMapLock.Lock()
 	defer roomMapLock.Unlock()
 
-	user := newUser(authToken)
-
 	room, ok := roomMap[roomId]
 	if !ok {
 		room = newRoom(roomId)
 		roomMap[roomId] = room
-		log.Printf("Created new room %s by user %s\n", room.id, user.Id)
-	} else {
-		log.Printf("User %s joined room %s\n", user.Id, room.id)
 	}
-
 	room.lock.Lock()
-	room.users[user.Id] = user
-	room.broadcastUsers()
-	room.lock.Unlock()
-	return room, user, nil
+	defer room.lock.Unlock()
+
+	var user *User
+	createdUser := false
+	if session := room.sessionByAuth(authToken); session != nil {
+		user = session.User
+	} else {
+		user = newUser(authToken)
+		createdUser = true
+		log.Printf("New user %s joined room %s\n", user.Id, room.id)
+	}
+	session := &Session{
+		Id:     uuid.New(),
+		Events: make(chan Event, 32),
+		User:   user,
+	}
+	room.sessions[session.Id] = session
+	session.Events <- SessionEvent{SessionId: session.Id.String()}
+	if createdUser {
+		room.broadcastUsers()
+	} else {
+		session.Events <- newUpdateUsersEvent(room.sessions)
+	}
+	return room, session, nil
 }
 
 // CloseAll shutdowns gracefully all connections and removes all rooms.
@@ -69,23 +83,29 @@ func CloseAll() {
 
 func newRoom(id string) *Room {
 	return &Room{
-		id:    id,
-		users: make(map[UserId]*User),
+		id:       id,
+		sessions: make(map[SessionId]*Session, 0),
 	}
 }
 
-// RemoveUser removes given user from current room by interrupting all
-// active connections like streams user watches or even his own stream.
-func (room *Room) RemoveUser(user *User) {
+// // RemoveSession removes given user from current room by interrupting all
+// // active connections like streams user watches or even his own stream.
+func (room *Room) RemoveSession(session *Session) {
 	room.lock.Lock()
 	defer room.lock.Unlock()
 
-	log.Printf("Removing user %s from room %s\n", user.Id.String(), room.id)
-	room.kickFromStreams(user)
-	room.stopStream(user)
-	delete(room.users, user.Id)
+	room.kickFromStreams(session)
+	delete(room.sessions, session.Id)
+	if room.user(session.User.Id) != nil {
+		log.Printf("Session %s has quit from room %s\n", session.Id.String(), room.id)
+		return
+	}
 
-	if len(room.users) > 0 {
+	user := session.User
+	log.Printf("Removing user %s from room %s\n", user.Id.String(), room.id)
+	room.stopStream(user)
+
+	if len(room.sessions) > 0 {
 		room.broadcastUsers()
 	} else {
 		log.Printf("Closing room %s, because all users have left!\n", user.Id.String())
@@ -97,14 +117,14 @@ func (room *Room) RemoveUser(user *User) {
 }
 
 // kickFromStreams kicks given user from all streams of all users in current room.
-func (room *Room) kickFromStreams(user *User) {
-	for _, streamer := range room.users {
-		stream := streamer.stream.Load().(*userStream)
+func (room *Room) kickFromStreams(session *Session) {
+	for _, streamerSession := range room.sessions {
+		stream := streamerSession.User.stream.Load().(*userStream)
 		if stream != nil {
 			stream.lock.Lock()
-			if whepSession, ok := stream.viewers[user.Id]; ok {
+			if whepSession, ok := stream.viewers[session.Id]; ok {
 				_ = whepSession.peerConn.Close()
-				delete(stream.viewers, user.Id)
+				delete(stream.viewers, session.Id)
 			}
 			stream.lock.Unlock()
 		}
@@ -134,48 +154,63 @@ func (room *Room) stopStream(user *User) {
 }
 
 func (room *Room) close() {
-	for userId, user := range room.users {
-		room.kickFromStreams(user)
-		room.stopStream(user)
-		close(user.Events)
-		delete(room.users, userId)
+	for sessionId, session := range room.sessions {
+		room.kickFromStreams(session)
+		room.stopStream(session.User)
+		close(session.Events)
+		delete(room.sessions, sessionId)
 	}
 }
 
-func (room *Room) findByToken(authToken string) *User {
-	for _, user := range room.users {
-		if user.authToken == authToken {
-			return user
+func (room *Room) User(userId UserId) *User {
+	room.lock.Lock()
+	defer room.lock.Unlock()
+	return room.user(userId)
+}
+
+func (room *Room) user(userId UserId) *User {
+	for _, session := range room.sessions {
+		if session.User.Id == userId {
+			return session.User
+		}
+	}
+	return nil
+}
+
+func (room *Room) sessionByAuth(authToken string) *Session {
+	for _, session := range room.sessions {
+		if session.User.AuthToken == authToken {
+			return session
 		}
 	}
 	return nil
 }
 
 func (room *Room) broadcast(event Event) {
-	for _, user := range room.users {
-		user.Events <- event
+	for _, session := range room.sessions {
+		session.Events <- event
 	}
 }
 
 func (room *Room) broadcastUsers() {
-	users := make([]UserMeta, 0, len(room.users))
-	for _, user := range room.users {
-		stream := user.stream.Load().(*userStream)
-		users = append(users, UserMeta{
-			Id:        user.Id.String(),
-			Streaming: stream != nil,
-		})
-	}
-	room.broadcast(UpdateUsersEvent{Users: users})
+	room.broadcast(newUpdateUsersEvent(room.sessions))
+}
+
+type SessionId = uuid.UUID
+
+type Session struct {
+	Id     SessionId
+	Events chan Event
+	User   *User
 }
 
 type UserId = uuid.UUID
 
+// User represents one or more active connections to Room from unique AuthToken.
 type User struct {
-	Id     UserId
-	Events chan Event
-	// authToken used for WHIP authentication as streamKey and REST api as Authorization header.
-	authToken string
+	Id UserId
+	// AuthToken used for WHIP authentication as streamKey and REST api as Authorization header.
+	AuthToken string
 
 	// stream represents active userStream, nil if not currently streaming.
 	stream atomic.Value
@@ -184,8 +219,7 @@ type User struct {
 func newUser(authToken string) *User {
 	user := &User{
 		Id:        uuid.New(),
-		Events:    make(chan Event, 32),
-		authToken: authToken,
+		AuthToken: authToken,
 	}
 	user.stream.Store((*userStream)(nil))
 	return user
@@ -198,7 +232,7 @@ type userStream struct {
 	lock             sync.RWMutex
 	videoTrackLabels []string
 	audioTrack       *webrtc.TrackLocalStaticRTP
-	viewers          map[UserId]*whepSession
+	viewers          map[SessionId]*whepSession
 }
 
 func newUserStream(peerConnection *webrtc.PeerConnection) (*userStream, error) {
@@ -228,12 +262,12 @@ func (stream *userStream) addVideoTrack(rid string) error {
 	return nil
 }
 
-func (stream *userStream) removeViewer(viewer *User) {
+func (stream *userStream) removeViewer(viewer *Session) {
 	stream.lock.Lock()
 	defer stream.lock.Unlock()
 
 	if viewerSession, ok := stream.viewers[viewer.Id]; ok {
-		_ = viewerSession.peerConn.Close()
+		viewerSession.close()
 		delete(stream.viewers, viewer.Id)
 	}
 }
@@ -244,19 +278,41 @@ func (stream *userStream) stop() {
 
 	_ = stream.peerConn.Close()
 	for viewerId, viewer := range stream.viewers {
-		_ = viewer.peerConn.Close()
+		viewer.close()
 		delete(stream.viewers, viewerId)
 	}
+}
+
+func FindSession(sessionId SessionId) (*Room, *Session) {
+	roomMapLock.Lock()
+	defer roomMapLock.Unlock()
+
+	for _, room := range roomMap {
+		for _, session := range room.sessions {
+			if session.Id == sessionId {
+				return room, session
+			}
+		}
+	}
+	return nil, nil
 }
 
 // findUserByAuth finds Room and User where user with given authToken is currently located.
 func findUserByAuth(authToken string) (*Room, *User) {
 	for _, room := range roomMap {
-		for _, user := range room.users {
-			if user.authToken == authToken {
+		for _, user := range usersFromSessions(room.sessions) {
+			if user.AuthToken == authToken {
 				return room, user
 			}
 		}
 	}
 	return nil, nil
+}
+
+func usersFromSessions(sessions map[SessionId]*Session) map[UserId]*User {
+	users := make(map[uuid.UUID]*User, 0)
+	for _, session := range sessions {
+		users[session.User.Id] = session.User
+	}
+	return users
 }
