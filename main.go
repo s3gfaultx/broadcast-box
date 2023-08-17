@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path"
 	"strings"
 
@@ -39,6 +40,13 @@ func whipHandler(res http.ResponseWriter, r *http.Request) {
 	streamKey = strings.TrimPrefix(streamKey, "Bearer ")
 	if streamKey == "" {
 		logHTTPError(res, "Authorization was not set", http.StatusBadRequest)
+		return
+	}
+
+	if r.Method == http.MethodDelete {
+		if err := room.FinishWHIP(streamKey); err != nil {
+			logHTTPError(res, err.Error(), http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -145,13 +153,13 @@ func roomEvents(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	room, session, err := room.JoinRoom(roomId, authToken)
+	room, user, err := room.Join(roomId, authToken)
 	if err != nil {
 		logHTTPError(res, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer func() {
-		room.RemoveUser(session)
+		room.RemoveUser(user)
 	}()
 
 	res.Header().Set("Content-Type", "text/event-stream")
@@ -160,7 +168,10 @@ func roomEvents(res http.ResponseWriter, req *http.Request) {
 
 	for {
 		select {
-		case event := <-session.Events:
+		case event, ok := <-user.Events:
+			if !ok {
+				return
+			}
 			serialized, err := json.Marshal(event)
 			if err != nil {
 				logHTTPError(res, fmt.Errorf("marshal event: %s", err.Error()).Error(), http.StatusInternalServerError)
@@ -248,8 +259,18 @@ func main() {
 
 	log.Println("Running HTTP Server at `" + os.Getenv("HTTP_ADDRESS") + "`")
 
-	log.Fatal((&http.Server{
+	srv := &http.Server{
 		Handler: mux,
 		Addr:    os.Getenv("HTTP_ADDRESS"),
-	}).ListenAndServe())
+	}
+	go func() {
+		log.Fatalln(srv.ListenAndServe())
+	}()
+
+	interruptChan := make(chan os.Signal, 1)
+	signal.Notify(interruptChan, os.Interrupt)
+	<-interruptChan
+
+	log.Println("Shutting down...")
+	room.CloseAll()
 }

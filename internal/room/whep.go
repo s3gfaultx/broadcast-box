@@ -19,6 +19,7 @@ type (
 		currentLayer   atomic.Value
 		sequenceNumber uint16
 		timestamp      uint32
+		peerConn       *webrtc.PeerConnection
 	}
 	simulcastLayerResponse struct {
 		EncodingId string `json:"encodingId"`
@@ -88,8 +89,8 @@ func WHEP(offer, authToken string, streamerId uuid.UUID) (string, string, error)
 	room.lock.Lock()
 	defer room.lock.Unlock()
 
-	watcher := room.findByToken(authToken)
-	if watcher == nil {
+	viewer := room.findByToken(authToken)
+	if viewer == nil {
 		return "", "", errors.New("unauthorized")
 	}
 	streamVal := streamer.stream.Load()
@@ -110,9 +111,7 @@ func WHEP(offer, authToken string, streamerId uuid.UUID) (string, string, error)
 				log.Printf("Could not close failed %s user connection: %s", authToken, err)
 			}
 		} else if state == webrtc.ICEConnectionStateClosed {
-			stream.lock.Lock()
-			delete(stream.viewers, watcher.Id)
-			stream.lock.Unlock()
+			stream.removeViewer(viewer)
 		}
 	})
 
@@ -167,10 +166,11 @@ func WHEP(offer, authToken string, streamerId uuid.UUID) (string, string, error)
 	whepSession := &whepSession{
 		videoTrack: videoTrack,
 		timestamp:  50000,
+		peerConn:   peerConnection,
 	}
 	whepSession.currentLayer.Store("")
-	stream.viewers[watcher.Id] = whepSession
-	return peerConnection.LocalDescription().SDP, watcher.Id.String(), nil
+	stream.viewers[viewer.Id] = whepSession
+	return peerConnection.LocalDescription().SDP, viewer.Id.String(), nil
 }
 
 func (w *whepSession) sendVideoPacket(rtpPkt *rtp.Packet, layer string, timeDiff uint32, isAV1 bool) error {

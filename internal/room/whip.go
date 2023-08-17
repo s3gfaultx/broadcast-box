@@ -93,6 +93,19 @@ func videoWriter(remoteTrack *webrtc.TrackRemote, stream *userStream, peerConnec
 	}
 }
 
+func FinishWHIP(authToken string) error {
+	roomMapLock.Lock()
+	defer roomMapLock.Unlock()
+	room, user := findUserByAuth(authToken)
+	if room == nil {
+		return errors.New("not connected to any room")
+	}
+	room.lock.Lock()
+	room.stopStream(user)
+	room.lock.Unlock()
+	return nil
+}
+
 func WHIP(offer, authToken string) (string, error) {
 	roomMapLock.Lock()
 	defer roomMapLock.Unlock()
@@ -102,29 +115,13 @@ func WHIP(offer, authToken string) (string, error) {
 	}
 	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("new peer connection: %w", err)
 	}
-	stream, err := newUserStream(peerConnection)
+	stream, err := room.startStream(user, peerConnection)
 	if err != nil {
-		return "", fmt.Errorf("create user stream: %s", err)
+		return "", fmt.Errorf("start stream: %w", err)
 	}
-	finishedStreaming := offer == ""
-	if finishedStreaming {
-		stream := user.stream.Load().(*userStream)
-		if stream == nil {
-			return "", errors.New("empty offer")
-		}
-		err := stream.peerConnection.Close()
-		if err != nil {
-			return "", fmt.Errorf("close peer connection: %s", err)
-		}
-		return "", nil
-	}
-	if !user.stream.CompareAndSwap((*userStream)(nil), stream) {
-		return "", errors.New("already streaming")
-	}
-	room.broadcastUsers()
-	log.Printf("Initialized %s user stream in room %s.\n", user.Id, room.id)
+	log.Printf("Initializing %s user stream in room %s.\n", user.Id, room.id)
 
 	peerConnection.OnTrack(func(remoteTrack *webrtc.TrackRemote, rtpReceiver *webrtc.RTPReceiver) {
 		mimeType := remoteTrack.Codec().RTPCodecCapability.MimeType
@@ -150,11 +147,9 @@ func WHIP(offer, authToken string) (string, error) {
 				log.Printf("Could not close failed peer connection of user %s: %s\n", user.Id, err)
 			}
 		} else if state == webrtc.ICEConnectionStateClosed {
-			// todo: make sure it is enough
-			room.lock.RLock()
-			user.stream.CompareAndSwap(stream, (*userStream)(nil))
-			room.broadcastUsers()
-			room.lock.RUnlock()
+			room.lock.Lock()
+			room.stopStream(user)
+			room.lock.Unlock()
 		}
 	})
 

@@ -24,12 +24,12 @@ type Room struct {
 	id string
 
 	lock  sync.RWMutex
-	users map[uuid.UUID]*User
+	users map[UserId]*User
 }
 
-// JoinRoom adds new user with provided authToken to existing room with given roomId or
+// Join adds new user with provided authToken to existing room with given roomId or
 // creates new room with given roomId.
-func JoinRoom(roomId string, authToken string) (*Room, *User, error) {
+func Join(roomId string, authToken string) (*Room, *User, error) {
 	if len(authToken) == 0 || len(authToken) >= 1024 {
 		return nil, nil, ErrInvalidAuthToken
 	}
@@ -55,26 +55,91 @@ func JoinRoom(roomId string, authToken string) (*Room, *User, error) {
 	return room, user, nil
 }
 
-func newRoom(id string) *Room {
-	return &Room{
-		id:    id,
-		users: make(map[uuid.UUID]*User),
+// CloseAll shutdowns gracefully all connections and removes all rooms.
+func CloseAll() {
+	roomMapLock.Lock()
+	defer roomMapLock.Unlock()
+
+	for _, room := range roomMap {
+		room.lock.Lock()
+		room.close()
+		room.lock.Unlock()
 	}
 }
 
+func newRoom(id string) *Room {
+	return &Room{
+		id:    id,
+		users: make(map[UserId]*User),
+	}
+}
+
+// RemoveUser removes given user from current room by interrupting all
+// active connections like streams user watches or even his own stream.
 func (room *Room) RemoveUser(user *User) {
-	log.Printf("Removing user %s from room %s\n", user.Id.String(), room.id)
 	room.lock.Lock()
+	defer room.lock.Unlock()
+
+	log.Printf("Removing user %s from room %s\n", user.Id.String(), room.id)
+	room.kickFromStreams(user)
+	room.stopStream(user)
 	delete(room.users, user.Id)
+
 	if len(room.users) > 0 {
 		room.broadcastUsers()
 	} else {
 		log.Printf("Closing room %s, because all users have left!\n", user.Id.String())
 		roomMapLock.Lock()
+		room.close()
 		delete(roomMap, room.id)
 		roomMapLock.Unlock()
 	}
-	room.lock.Unlock()
+}
+
+// kickFromStreams kicks given user from all streams of all users in current room.
+func (room *Room) kickFromStreams(user *User) {
+	for _, streamer := range room.users {
+		stream := streamer.stream.Load().(*userStream)
+		if stream != nil {
+			stream.lock.Lock()
+			if whepSession, ok := stream.viewers[user.Id]; ok {
+				_ = whepSession.peerConn.Close()
+				delete(stream.viewers, user.Id)
+			}
+			stream.lock.Unlock()
+		}
+	}
+}
+
+func (room *Room) startStream(user *User, peerConn *webrtc.PeerConnection) (*userStream, error) {
+	stream, err := newUserStream(peerConn)
+	if err != nil {
+		return nil, fmt.Errorf("create user stream: %s", err)
+	}
+
+	room.lock.Lock()
+	defer room.lock.Unlock()
+	if !user.stream.CompareAndSwap((*userStream)(nil), stream) {
+		return nil, errors.New("already streaming")
+	}
+	room.broadcastUsers()
+	return stream, nil
+}
+
+func (room *Room) stopStream(user *User) {
+	if stream := user.stream.Swap((*userStream)(nil)).(*userStream); stream != nil {
+		stream.stop()
+	}
+	room.broadcastUsers()
+}
+
+func (room *Room) close() {
+	for userId, user := range room.users {
+		room.kickFromStreams(user)
+		room.stopStream(user)
+		close(user.Events)
+		delete(room.users, userId)
+	}
 }
 
 func (room *Room) findByToken(authToken string) *User {
@@ -85,12 +150,6 @@ func (room *Room) findByToken(authToken string) *User {
 	}
 	return nil
 }
-
-// // hasPermission indicates whether user with given authToken has permission to
-// // access this room data e.g. streams.
-// func (room *Room) hasPermission(authToken string) bool {
-// 	return room.findByToken(authToken) != nil
-// }
 
 func (room *Room) broadcast(event Event) {
 	for _, user := range room.users {
@@ -110,8 +169,10 @@ func (room *Room) broadcastUsers() {
 	room.broadcast(UpdateUsersEvent{Users: users})
 }
 
+type UserId = uuid.UUID
+
 type User struct {
-	Id     uuid.UUID
+	Id     UserId
 	Events chan Event
 	// authToken used for WHIP authentication as streamKey and REST api as Authorization header.
 	authToken string
@@ -131,13 +192,13 @@ func newUser(authToken string) *User {
 }
 
 type userStream struct {
-	pliChan        chan any
-	peerConnection *webrtc.PeerConnection
+	pliChan  chan any
+	peerConn *webrtc.PeerConnection
 
 	lock             sync.RWMutex
 	videoTrackLabels []string
 	audioTrack       *webrtc.TrackLocalStaticRTP
-	viewers          map[uuid.UUID]*whepSession
+	viewers          map[UserId]*whepSession
 }
 
 func newUserStream(peerConnection *webrtc.PeerConnection) (*userStream, error) {
@@ -147,10 +208,10 @@ func newUserStream(peerConnection *webrtc.PeerConnection) (*userStream, error) {
 	}
 	return &userStream{
 		pliChan:          make(chan any, 50),
-		peerConnection:   peerConnection,
+		peerConn:         peerConnection,
 		videoTrackLabels: make([]string, 0, 1),
 		audioTrack:       audioTrack,
-		viewers:          map[uuid.UUID]*whepSession{},
+		viewers:          map[UserId]*whepSession{},
 	}, nil
 }
 
@@ -165,6 +226,27 @@ func (stream *userStream) addVideoTrack(rid string) error {
 	}
 	stream.videoTrackLabels = append(stream.videoTrackLabels, rid)
 	return nil
+}
+
+func (stream *userStream) removeViewer(viewer *User) {
+	stream.lock.Lock()
+	defer stream.lock.Unlock()
+
+	if viewerSession, ok := stream.viewers[viewer.Id]; ok {
+		_ = viewerSession.peerConn.Close()
+		delete(stream.viewers, viewer.Id)
+	}
+}
+
+func (stream *userStream) stop() {
+	stream.lock.Lock()
+	defer stream.lock.Unlock()
+
+	_ = stream.peerConn.Close()
+	for viewerId, viewer := range stream.viewers {
+		_ = viewer.peerConn.Close()
+		delete(stream.viewers, viewerId)
+	}
 }
 
 // findUserByAuth finds Room and User where user with given authToken is currently located.
